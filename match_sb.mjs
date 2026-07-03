@@ -31,30 +31,46 @@ try {
 } catch { /* sin .env */ }
 const YT_API_KEY = (process.env.YT_API_KEY || "").trim();
 
-const [slug, idxArg, totalArg, listArg] = process.argv.slice(2);
-if (!slug || idxArg == null || !totalArg) {
-  console.error("Uso: node match_sb.mjs <slug> <idx> <total> [matchList]");
-  process.exit(1);
-}
-const IDX = +idxArg, TOTAL = +totalArg;
-
 // yt-dlp / ffmpeg: como match_runner, via env YTDLP/FFMPEG o defaults. En local apuntá al
 // .exe de bin/ y al ffmpeg de Remotion; en el farm quedan "yt-dlp"/"ffmpeg" del PATH.
 const YTDLP = process.env.YTDLP || "yt-dlp";
 const FF = process.env.FFMPEG || "ffmpeg";
-
-const LIST = listArg || `match_${slug}.json`;
-if (!fs.existsSync(LIST)) { console.error("No existe match list:", LIST); process.exit(1); }
-const allBeats = JSON.parse(fs.readFileSync(LIST, "utf8").replace(/^﻿/, ""));
-const beats = allBeats.filter((_, i) => i % TOTAL === IDX);
-console.log(`shard ${IDX}/${TOTAL}: ${beats.length} beats`);
-console.log(`búsqueda: ${YT_API_KEY ? "YouTube Data API (oficial)" : "yt-dlp ytsearch (sin YT_API_KEY)"}`);
-
 const CANDS = +(process.env.MATCH_CANDS || 6);
 const POOL = +(process.env.MATCH_POOL || 16);
 const SB_MAXFRAGS = +(process.env.SB_MAXFRAGS || 24); // cap de fragmentos a bajar por candidato
+// SB_NO_INFO=1 → simula la NUBE (GitHub): fuerza que ytInfo devuelva null (yt-dlp -J bloqueado),
+// probando la rama de fallback API-duration + frames públicos 25/50/75%.
+const SB_NO_INFO = process.env.SB_NO_INFO === "1";
 
-const TMP = "_sb_" + IDX; // temp PROPIO por shard → seguro en paralelo
+// ── MODO REFINE: node match_sb.mjs --refine <clips_<slug>_matched.json> ──
+// 2ª capa (LOCAL): sobre cada ganador ya elegido por la nube, corre el flujo COMPLETO de
+// storyboard (-J, que en LOCAL sí anda) sobre ESE mismo video y actualiza `start` al segundo
+// exacto (fino). La nube eligió el VIDEO; local afina el MOMENTO. Se maneja abajo (isRefine).
+const argv = process.argv.slice(2);
+const isRefine = argv[0] === "--refine";
+
+let IDX = 0, TOTAL = 1, beats = [], refineList = null, refinePath = null;
+if (isRefine) {
+  refinePath = argv[1];
+  if (!refinePath || !fs.existsSync(refinePath)) { console.error("Uso: node match_sb.mjs --refine <clips_<slug>_matched.json>"); process.exit(1); }
+  refineList = JSON.parse(fs.readFileSync(refinePath, "utf8").replace(/^﻿/, ""));
+  console.log(`refine: ${refineList.length} entradas de ${refinePath}`);
+} else {
+  const [slug, idxArg, totalArg, listArg] = argv;
+  if (!slug || idxArg == null || !totalArg) {
+    console.error("Uso: node match_sb.mjs <slug> <idx> <total> [matchList]  |  --refine <matched.json>");
+    process.exit(1);
+  }
+  IDX = +idxArg; TOTAL = +totalArg;
+  const LIST = listArg || `match_${slug}.json`;
+  if (!fs.existsSync(LIST)) { console.error("No existe match list:", LIST); process.exit(1); }
+  const allBeats = JSON.parse(fs.readFileSync(LIST, "utf8").replace(/^﻿/, ""));
+  beats = allBeats.filter((_, i) => i % TOTAL === IDX);
+  console.log(`shard ${IDX}/${TOTAL}: ${beats.length} beats`);
+  console.log(`búsqueda: ${YT_API_KEY ? "YouTube Data API (oficial)" : "yt-dlp ytsearch (sin YT_API_KEY)"}`);
+}
+
+const TMP = "_sb_" + (isRefine ? "refine" : IDX); // temp PROPIO por shard → seguro en paralelo
 fs.rmSync(TMP, { recursive: true, force: true });
 fs.mkdirSync(TMP, { recursive: true });
 
@@ -144,12 +160,38 @@ const searchRanked = async (queries, concept, limit = CANDS) => {
 // + duration) sí sale sin login. Con cookie fallaba → todo caía al fallback con dur=0 (@0s).
 // La búsqueda ya usa la API oficial, así que las cookies no aportan nada aquí.
 const ytInfo = (id) => {
+  if (SB_NO_INFO) return null; // simula la nube: -J bloqueado
   const r = spawnSync(YTDLP, [
     `https://youtu.be/${id}`, "-J", "--skip-download", "--no-warnings",
     "--socket-timeout", "30",
   ], { encoding: "utf8", maxBuffer: 1 << 28, timeout: 60000, killSignal: "SIGKILL" });
   if (r.status !== 0 || !r.stdout) return null;
   try { return JSON.parse(r.stdout); } catch { return null; }
+};
+
+// ISO-8601 de YouTube (contentDetails.duration, ej "PT1H4M30S") → segundos.
+const iso8601ToSec = (s) => {
+  const m = /^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/.exec(s || "");
+  if (!m) return 0;
+  return (+m[1] || 0) * 3600 + (+m[2] || 0) * 60 + (+m[3] || 0);
+};
+// DURACIÓN vía YouTube Data API (batch hasta 50 ids = 1 unidad de cuota). Devuelve Map id→segundos.
+// Es lo que salva a la NUBE: -J bloqueado ⇒ sin duration ⇒ fallback caía a @0s. Con esto el
+// fallback mapea 25/50/75% a segundos REALES. {} si no hay key o error (loguea reason).
+const apiDurations = async (ids) => {
+  const out = new Map();
+  if (!YT_API_KEY || !ids.length) return out;
+  for (let i = 0; i < ids.length; i += 50) {
+    const batch = ids.slice(i, i + 50);
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${batch.join(",")}&key=${YT_API_KEY}`;
+    try {
+      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const j = await res.json();
+      if (j.error) { console.error(`  [API] videos.list error: ${res.status} ${j.error.errors?.[0]?.reason || j.error.status}`); continue; }
+      for (const it of (j.items || [])) out.set(it.id, iso8601ToSec(it.contentDetails?.duration));
+    } catch (e) { console.error(`  [API] videos.list fetch falló: ${e.message}`); }
+  }
+  return out;
 };
 
 // devuelve el mejor storyboard (sb0 preferido, luego más tiles). null si no hay.
@@ -253,6 +295,50 @@ const scoreTile = async (file, concept) => {
   return { c, rank: c * curve(textHi, 0.12, 0.35, 0.15), text: textHi };
 };
 
+// Puntúa TODOS los tiles de un video (storyboard si hay -J; si no, fallback con duración de API)
+// y devuelve el mejor {score, rank, t, text} o null. `apiDur` = duración por API (segundos) para
+// el fallback (clave para que la NUBE dé un timestamp coarse REAL y no @0s).
+const scoreVideo = async (id, concept, tag, apiDur = 0) => {
+  const info = ytInfo(id);
+  let tiles = [];
+  let dur0 = apiDur || 0;
+  if (info) {
+    dur0 = info.duration || dur0;
+    tiles = storyboardTiles(info, id, tag);
+  }
+  if (!tiles.length) tiles = fallbackTiles(id, dur0, tag); // NUBE: 25/50/75% × dur(API) → coarse real
+  if (!tiles.length) return null;
+  let bf = { c: -1, rank: -1, t: 0, text: 0 };
+  for (const tl of tiles) {
+    const r = await scoreTile(tl.file, concept);
+    if (r.rank > bf.rank) bf = { c: r.c, rank: r.rank, t: tl.t, text: r.text };
+  }
+  for (const tl of tiles) fs.rmSync(tl.file, { force: true });
+  return { score: +bf.c.toFixed(4), rank: +bf.rank.toFixed(4), t: bf.t, text: +bf.text.toFixed(2), fine: !!info };
+};
+
+// ── MODO REFINE: afina el `start` de cada ganador con el storyboard FINO (local) ──
+if (isRefine) {
+  let refined = 0;
+  for (const e of refineList) {
+    const id = vidId(e.url || "");
+    if (!id) { console.log(`  ✗ ${e.name}: sin id`); continue; }
+    const r = await scoreVideo(id, e.concept || "", `refine_${id}`);
+    if (!r) { console.log(`  ✗ ${e.name}: sin tiles (${id})`); continue; }
+    const lead = e.lead || 0;
+    const newStart = Math.max(0, +(r.t - lead).toFixed(1));
+    const old = e.start;
+    e.start = newStart;
+    if (r.fine) e._sb = true; // afinado con storyboard real
+    refined++;
+    console.log(`  ${e.name}: ${old}s → ${newStart}s  (${r.fine ? "fino" : "coarse"} ${r.score.toFixed(3)}, ${id})`);
+  }
+  fs.writeFileSync(refinePath, JSON.stringify(refineList, null, 2));
+  console.log(`→ ${refinePath} (${refined}/${refineList.length} afinados)`);
+  fs.rmSync(TMP, { recursive: true, force: true });
+  process.exit(0);
+}
+
 // ── loop principal ──
 const results = [];
 const usedIds = new Set();
@@ -263,29 +349,18 @@ for (const b of beats) {
   else cands = await searchRanked(Array.isArray(b.query) ? b.query : [b.query], concept);
   if (!cands.length) { console.log(`✗ ${name}: sin candidatos`); continue; }
 
+  // Prefetch de DURACIONES por API (1 unidad de cuota por lote de 50) → el fallback de la NUBE
+  // mapea 25/50/75% a segundos reales. Barato y evita @0s cuando -J está bloqueado.
+  const durMap = await apiDurations([...new Set(cands.map((c) => c.id).filter(Boolean))]);
+
   const scored = [];
   for (let i = 0; i < cands.length; i++) {
     const cand = cands[i];
     if (!cand.id) continue;
-    const tag = `${name}_${i}`;
-    const info = ytInfo(cand.id);
-    let tiles = [];
-    let dur0 = cand.dur || 0;
-    if (info) {
-      dur0 = info.duration || dur0;
-      tiles = storyboardTiles(info, cand.id, tag);
-    }
-    if (!tiles.length) tiles = fallbackTiles(cand.id, dur0, tag); // fallback siempre disponible
-    if (!tiles.length) { if (process.env.MATCH_DEBUG) console.error(`  [dbg] ${name} cand ${cand.id}: 0 tiles`); continue; }
-    // elegimos el tile por RANK (concepto × limpieza-de-texto), pero reportamos el score de
-    // concepto PURO de ese tile como _score (para filtrar on-topic aguas abajo, igual que match_runner).
-    let bf = { c: -1, rank: -1, t: 0, text: 0 };
-    for (const tl of tiles) {
-      const r = await scoreTile(tl.file, concept);
-      if (r.rank > bf.rank) bf = { c: r.c, rank: r.rank, t: tl.t, text: r.text };
-    }
-    for (const tl of tiles) fs.rmSync(tl.file, { force: true });
-    scored.push({ score: +bf.c.toFixed(4), rank: +bf.rank.toFixed(4), t: bf.t, text: +bf.text.toFixed(2), url: cand.url, id: cand.id });
+    const apiDur = durMap.get(cand.id) || cand.dur || 0;
+    const r = await scoreVideo(cand.id, concept, `${name}_${i}`, apiDur);
+    if (!r) { if (process.env.MATCH_DEBUG) console.error(`  [dbg] ${name} cand ${cand.id}: 0 tiles`); continue; }
+    scored.push({ ...r, url: cand.url, id: cand.id });
   }
   if (!scored.length) { console.log(`✗ ${name}: sin tiles`); continue; }
   scored.sort((a, b2) => b2.rank - a.rank);
@@ -295,7 +370,7 @@ for (const b of beats) {
   if (fresh) best = fresh;
   if (best.id) usedIds.add(best.id);
   const start = Math.max(0, +(best.t - lead).toFixed(1));
-  console.log(`  ${name}: ${best.score.toFixed(3)} @ ${best.t}s (${best.id})${best.text > 0.3 ? ` ⚠txt${best.text}` : ""}`);
+  console.log(`  ${name}: ${best.score.toFixed(3)} @ ${best.t}s (${best.id})${best.fine ? "" : " ~coarse"}${best.text > 0.3 ? ` ⚠txt${best.text}` : ""}`);
   results.push({ name, concept, url: best.url, start, dur, _score: +best.score.toFixed(3), _sb: true });
 }
 
