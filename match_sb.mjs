@@ -29,7 +29,13 @@ try {
     if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2].trim().replace(/^["']|["']$/g, "");
   }
 } catch { /* sin .env */ }
-const YT_API_KEY = (process.env.YT_API_KEY || "").trim();
+// MULTI-KEY: YT_API_KEY, YT_API_KEY2..N (las que existan). Round-robin por request + failover
+// ante quotaExceeded (cuota diaria de una key agotada → siguiente key). 1 sola key = no rota.
+const YT_API_KEYS = [
+  process.env.YT_API_KEY, process.env.YT_API_KEY2, process.env.YT_API_KEY3, process.env.YT_API_KEY4,
+  process.env.YT_API_KEY5, process.env.YT_API_KEY6,
+].map((k) => (k || "").trim()).filter(Boolean);
+const YT_API_KEY = YT_API_KEYS[0] || ""; // compat: el resto del código chequea "hay key?"
 
 // yt-dlp / ffmpeg: como match_runner, via env YTDLP/FFMPEG o defaults. En local apuntá al
 // .exe de bin/ y al ffmpeg de Remotion; en el farm quedan "yt-dlp"/"ffmpeg" del PATH.
@@ -41,6 +47,9 @@ const SB_MAXFRAGS = +(process.env.SB_MAXFRAGS || 24); // cap de fragmentos a baj
 // SB_NO_INFO=1 → simula la NUBE (GitHub): fuerza que ytInfo devuelva null (yt-dlp -J bloqueado),
 // probando la rama de fallback API-duration + frames públicos 25/50/75%.
 const SB_NO_INFO = process.env.SB_NO_INFO === "1";
+// SB_ALL_QUERIES=1 → en modo API, usar TODAS las variantes de query (más candidatos, más cuota).
+// Default: solo la 1ª variante por concepto (ahorra cuota; 150 conceptos × 1 key alcanza).
+const SB_ALL_QUERIES = process.env.SB_ALL_QUERIES === "1";
 
 // ── MODO REFINE: node match_sb.mjs --refine <clips_<slug>_matched.json> ──
 // 2ª capa (LOCAL): sobre cada ganador ya elegido por la nube, corre el flujo COMPLETO de
@@ -67,7 +76,7 @@ if (isRefine) {
   const allBeats = JSON.parse(fs.readFileSync(LIST, "utf8").replace(/^﻿/, ""));
   beats = allBeats.filter((_, i) => i % TOTAL === IDX);
   console.log(`shard ${IDX}/${TOTAL}: ${beats.length} beats`);
-  console.log(`búsqueda: ${YT_API_KEY ? "YouTube Data API (oficial)" : "yt-dlp ytsearch (sin YT_API_KEY)"}`);
+  console.log(`búsqueda: ${YT_API_KEY ? `YouTube Data API (${YT_API_KEYS.length} key${YT_API_KEYS.length > 1 ? "s" : ""}, retry+rotación, ${SB_ALL_QUERIES ? "todas las queries" : "1 query/concepto"})` : "yt-dlp ytsearch (sin YT_API_KEY)"}`);
 }
 
 const TMP = "_sb_" + (isRefine ? "refine" : IDX); // temp PROPIO por shard → seguro en paralelo
@@ -108,26 +117,89 @@ const rerank = (rows, queries, concept, limit) => {
   return [...seen.values()].sort((a, b) => (b.lex - a.lex) || (a.rank - b.rank)).slice(0, limit);
 };
 
-// FUENTE A: YouTube Data API oficial (sin rate-limit). Una llamada por variante de query,
-// items en orden de relevancia. Devuelve filas {id,title} (dur no viene en search.list; queda 0
-// y luego se completa con la metadata del storyboard/ytInfo). null si falla (para caer a ytsearch).
-const apiSearch = async (q) => {
-  const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=25`
-    + `&relevanceLanguage=es&q=${encodeURIComponent(q)}&key=${YT_API_KEY}`;
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
-    const j = await res.json();
-    if (j.error) {
-      const reason = j.error.errors?.[0]?.reason || j.error.status || j.error.code;
-      console.error(`  [API] error q="${q}": ${res.status} ${reason} → fallback ytsearch`);
-      return null;
-    }
-    return (j.items || []).map((it) => ({ id: it.id?.videoId, title: it.snippet?.title || "", dur: 0 }))
-      .filter((r) => r.id);
-  } catch (e) {
-    console.error(`  [API] fetch falló q="${q}": ${e.message} → fallback ytsearch`);
-    return null;
+// ── HTTP a la YouTube Data API con RETRY + MULTI-KEY + failover ──
+// Problema real observado en la nube: 20 shards contra 1 key → 429 rateLimitExceeded (límite POR
+// SEGUNDO, no cuota diaria) → caían al fallback ytsearch (bloqueado en GitHub) → 25/150.
+// Estrategia:
+//  · rateLimitExceeded (429): TRANSITORIO → backoff exponencial + jitter (1s,2s,4s,8s) y reintentar;
+//    también probamos con OTRA key por si esa está caliente.
+//  · quotaExceeded (403): cuota DIARIA de esa key agotada → marcar key muerta y pasar a la siguiente.
+//  · jitter corto entre llamadas para no ametrallar.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const jitter = (base, spread) => base + Math.floor(Math.random() * spread);
+let keyPtr = ((+process.env.SHARD_IDX || IDX || 0)) % Math.max(1, YT_API_KEYS.length); // arranca distinto por shard
+const deadKeys = new Set(); // keys con quotaExceeded (cuota diaria) → no reusar en este run
+const nextKey = () => {
+  for (let i = 0; i < YT_API_KEYS.length; i++) {
+    const k = YT_API_KEYS[keyPtr % YT_API_KEYS.length];
+    keyPtr++;
+    if (!deadKeys.has(k)) return k;
   }
+  return null; // todas muertas
+};
+const kTag = (k) => "…" + (k || "").slice(-4);
+
+// GET con reintentos. Devuelve el JSON parseado (con .items) o null si se agotó todo.
+const apiGet = async (buildUrl, ctx) => {
+  const MAX = 4;
+  for (let attempt = 0; attempt < MAX; attempt++) {
+    const key = nextKey();
+    if (!key) { console.error(`  [API] ${ctx}: sin keys vivas (todas quotaExceeded)`); return null; }
+    try {
+      await sleep(jitter(150, 250)); // ~150-400ms anti-ráfaga
+      const res = await fetch(buildUrl(key), { signal: AbortSignal.timeout(30000) });
+      const j = await res.json().catch(() => ({}));
+      if (!j.error) return j;
+      const reason = j.error.errors?.[0]?.reason || j.error.status || j.error.code;
+      if (reason === "quotaExceeded" || reason === "dailyLimitExceeded") {
+        deadKeys.add(key);
+        console.error(`  [API] ${ctx}: quota agotada en key ${kTag(key)} → rotando`);
+        continue; // NO cuenta como retry-con-espera: probamos otra key ya
+      }
+      if (res.status === 429 || reason === "rateLimitExceeded" || reason === "userRateLimitExceeded") {
+        const wait = jitter(1000 * 2 ** attempt, 500); // 1s,2s,4s,8s (+jitter)
+        console.error(`  [API] ${ctx}: 429 ${reason} key ${kTag(key)} → backoff ${wait}ms (intento ${attempt + 1}/${MAX})`);
+        await sleep(wait);
+        continue;
+      }
+      console.error(`  [API] ${ctx}: error ${res.status} ${reason} → fallback`);
+      return null; // error no recuperable (400 badRequest, keyInvalid, etc.)
+    } catch (e) {
+      const wait = jitter(1000 * 2 ** attempt, 500);
+      console.error(`  [API] ${ctx}: fetch falló (${e.message}) → backoff ${wait}ms (intento ${attempt + 1}/${MAX})`);
+      await sleep(wait);
+    }
+  }
+  console.error(`  [API] ${ctx}: agotados ${MAX} reintentos → fallback`);
+  return null;
+};
+
+// CACHE de búsquedas POR PROCESO (por shard). search.list cuesta 100 unidades (10k/día = 100
+// búsquedas) → memoizar es clave. Si varios beats comparten la MISMA query (ej N ángulos del mismo
+// dulce con igual query[0]) se hace UNA sola llamada y todos reusan el pool; el dedup usedIds
+// reparte videos/momentos distintos del pool (estilo docextract). No se persiste a disco.
+const searchCache = new Map(); // queryNorm → filas [] (o [] si falló, para no repegar)
+const qNorm = (q) => (q || "").trim().toLowerCase().replace(/\s+/g, " ");
+
+// FUENTE A: YouTube Data API oficial (con retry/rotación + cache). Una llamada por variante de
+// query, items en orden de relevancia. Devuelve filas {id,title} o null (para caer a ytsearch).
+const apiSearch = async (q) => {
+  const key = qNorm(q);
+  if (searchCache.has(key)) {
+    const cached = searchCache.get(key);
+    console.log(`  [API] cache HIT q="${q}" (${cached.length} cands, 0 unidades)`);
+    return cached;
+  }
+  const j = await apiGet(
+    (k) => `https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&maxResults=25`
+      + `&relevanceLanguage=es&q=${encodeURIComponent(q)}&key=${k}`,
+    `search q="${q}"`,
+  );
+  if (!j) return null; // error → NO cachear (que reintente / caiga a ytsearch en el próximo beat)
+  const rows = (j.items || []).map((it) => ({ id: it.id?.videoId, title: it.snippet?.title || "", dur: 0 }))
+    .filter((r) => r.id);
+  searchCache.set(key, rows);
+  return rows;
 };
 
 // FUENTE B (fallback): yt-dlp ytsearch (rate-limitable). Devuelve filas {id,title,dur}.
@@ -143,15 +215,18 @@ const ytsearch = (q) => {
 };
 
 const searchRanked = async (queries, concept, limit = CANDS) => {
+  // En modo API usamos SOLO la 1ª variante por defecto (ahorra cuota; 150 conceptos × 1 key
+  // alcanza). SB_ALL_QUERIES=1 vuelve a todas. Sin key (fallback ytsearch) sí usa todas.
+  const apiQueries = (YT_API_KEY && !SB_ALL_QUERIES) ? queries.slice(0, 1) : queries;
   const rows = [];
-  for (const q of queries) {
+  for (const q of apiQueries) {
     if (!q) continue;
     let got = null;
-    if (YT_API_KEY) got = await apiSearch(q); // API oficial primero (sin rate-limit)
-    if (got == null) got = ytsearch(q);        // fallback: quota/403/sin-key → ytsearch
+    if (YT_API_KEY) got = await apiSearch(q); // API oficial (con retry/rotación) primero
+    if (got == null) got = ytsearch(q);        // fallback: sin-key / error no recuperable → ytsearch
     rows.push(...got);
   }
-  return rerank(rows, queries, concept, limit);
+  return rerank(rows, apiQueries, concept, limit);
 };
 
 // ── STORYBOARD: metadata + descarga de fragmentos + corte de tiles ──
@@ -183,13 +258,13 @@ const apiDurations = async (ids) => {
   if (!YT_API_KEY || !ids.length) return out;
   for (let i = 0; i < ids.length; i += 50) {
     const batch = ids.slice(i, i + 50);
-    const url = `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${batch.join(",")}&key=${YT_API_KEY}`;
-    try {
-      const res = await fetch(url, { signal: AbortSignal.timeout(30000) });
-      const j = await res.json();
-      if (j.error) { console.error(`  [API] videos.list error: ${res.status} ${j.error.errors?.[0]?.reason || j.error.status}`); continue; }
-      for (const it of (j.items || [])) out.set(it.id, iso8601ToSec(it.contentDetails?.duration));
-    } catch (e) { console.error(`  [API] videos.list fetch falló: ${e.message}`); }
+    // mismo apiGet → hereda retry/backoff en 429 y rotación de key en quotaExceeded.
+    const j = await apiGet(
+      (key) => `https://www.googleapis.com/youtube/v3/videos?part=contentDetails&id=${batch.join(",")}&key=${key}`,
+      `videos.list (${batch.length} ids)`,
+    );
+    if (!j) continue;
+    for (const it of (j.items || [])) out.set(it.id, iso8601ToSec(it.contentDetails?.duration));
   }
   return out;
 };
