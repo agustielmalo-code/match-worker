@@ -1,6 +1,7 @@
-# Matcher CLIP distribuido en GitHub Actions — VERSION COOKIES-ONLY (sin proxies).
-# Cada runner usa una cookie de YouTube (rotada por shard) para bajar SIN proxy desde
-# la IP del runner. Prueba: valida si cookies-en-IP-de-GitHub baja footage a escala.
+# Matcher por STORYBOARD (match_sb) en GitHub Actions.
+# Busca con la YouTube Data API oficial (secret YT_API_KEY, sin rate-limit) y puntúa con
+# los storyboards de i.ytimg (CDN, no bloqueado) — SIN cookies, SIN proxy, SIN bajar video.
+# Por eso corre en las IPs de GitHub sin el bloqueo que frena la descarga de video.
 name: match
 
 on:
@@ -27,26 +28,22 @@ jobs:
           echo "matrix=$LIST" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
       - name: cache node_modules
         id: nm
         uses: actions/cache@v4
         with:
           path: node_modules
           key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-      - name: install deps (solo si no hay cache)
+      - name: install deps
         if: steps.nm.outputs.cache-hit != 'true'
         run: |
           n=0; until npm ci; do n=$((n+1)); [ "$n" -ge 4 ] && exit 1; rm -rf node_modules; sleep 20; done
       - name: cache modelo CLIP
         uses: actions/cache@v4
-        with:
-          path: .cache
-          key: clipmodel-clip-vit-base-patch32
+        with: { path: .cache, key: clipmodel-clip-vit-base-patch32 }
       - name: prefetch modelo CLIP
-        run: |
-          node -e "import('@huggingface/transformers').then(async t=>{await t.pipeline('zero-shot-image-classification','Xenova/clip-vit-base-patch32',{dtype:'q8'});console.log('modelo CLIP cacheado');}).catch(e=>{console.error(e);process.exit(1)})"
+        run: node -e "import('@huggingface/transformers').then(async t=>{await t.pipeline('zero-shot-image-classification','Xenova/clip-vit-base-patch32',{dtype:'q8'});console.log('CLIP cacheado');}).catch(e=>{console.error(e);process.exit(1)})"
 
   match:
     needs: prepare
@@ -58,95 +55,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+        with: { node-version: "20" }
       - name: cache node_modules
         id: nm
         uses: actions/cache@v4
         with:
           path: node_modules
           key: nm-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
-      - name: install deps (solo si no hay cache)
+      - name: install deps
         if: steps.nm.outputs.cache-hit != 'true'
         run: |
-          n=0
-          until npm ci; do
-            n=$((n+1)); [ "$n" -ge 4 ] && { echo "npm ci fallo"; exit 1; }
-            echo "reintento $n"; rm -rf node_modules; sleep 20
-          done
+          n=0; until npm ci; do n=$((n+1)); [ "$n" -ge 4 ] && exit 1; rm -rf node_modules; sleep 20; done
       - name: cache modelo CLIP
         uses: actions/cache@v4
-        with:
-          path: .cache
-          key: clipmodel-clip-vit-base-patch32
+        with: { path: .cache, key: clipmodel-clip-vit-base-patch32 }
       - name: cache yt-dlp + ffmpeg
-        id: bin
         uses: actions/cache@v4
-        with:
-          path: ~/bincache
-          key: ytffmpeg-v1
-      - name: install yt-dlp (pip) + PO token plugin + ffmpeg
+        with: { path: ~/bincache, key: ytffmpeg-v2 }
+      - name: install yt-dlp + ffmpeg
         run: |
-          # yt-dlp por pip para que el plugin del PO token se auto-descubra en el mismo env
-          python3 -m pip install --user --upgrade --break-system-packages yt-dlp bgutil-ytdlp-pot-provider \
-            || python3 -m pip install --user --upgrade yt-dlp bgutil-ytdlp-pot-provider
-          echo "$HOME/.local/bin" >> $GITHUB_PATH
-          export PATH="$HOME/.local/bin:$PATH"
-          yt-dlp --version
-          yt-dlp -v --print "x" "ytsearch0:x" 2>&1 | grep -i "pot\|bgutil" | head -3 || true
-          # ffmpeg estatico
           mkdir -p ~/bincache
+          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/bincache/yt-dlp
+          chmod a+rx ~/bincache/yt-dlp; sudo cp ~/bincache/yt-dlp /usr/local/bin/yt-dlp; yt-dlp --version
           if [ ! -f ~/bincache/ffmpeg ]; then
             curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz
-            tar -xf /tmp/ff.tar.xz -C /tmp
-            cp /tmp/ffmpeg-*-static/ffmpeg ~/bincache/ffmpeg
-            chmod a+rx ~/bincache/ffmpeg
+            tar -xf /tmp/ff.tar.xz -C /tmp; cp /tmp/ffmpeg-*-static/ffmpeg ~/bincache/ffmpeg; chmod a+rx ~/bincache/ffmpeg
           fi
           sudo cp ~/bincache/ffmpeg /usr/local/bin/ffmpeg
-      - name: start PO token provider (bgutil, Docker en :4416)
-        run: |
-          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
-          echo "esperando el provider..."
-          for i in $(seq 1 40); do
-            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then echo "provider UP"; break; fi
-            sleep 2
-          done
-          curl -s http://127.0.0.1:4416/ping || echo "(ping fallo — sigo igual)"
-      - name: install deno (resuelve el JS n-challenge de YouTube)
+      - name: install deno (n-challenge de yt-dlp -J)
         run: |
           curl -fsSL https://deno.land/install.sh | DENO_INSTALL=$HOME/.deno sh
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
-          $HOME/.deno/bin/deno --version | head -1
       - name: download match list
+        env: { GH_TOKEN: "${{ github.token }}" }
+        run: gh release download "match-${{ github.event.inputs.slug }}" --pattern "match_${{ github.event.inputs.slug }}.json" --dir .
+      - name: match shard (storyboard + API)
         env:
-          GH_TOKEN: "${{ github.token }}"
-        run: |
-          gh release download "match-${{ github.event.inputs.slug }}" \
-            --pattern "match_${{ github.event.inputs.slug }}.json" --dir .
-      - name: inject cookies (1 por shard; base64 o texto plano; SIN proxies)
-        env:
-          YTCOOKIES1: ${{ secrets.YTCOOKIES1 }}
-          YTCOOKIES2: ${{ secrets.YTCOOKIES2 }}
-          YTCOOKIES3: ${{ secrets.YTCOOKIES3 }}
-          YTCOOKIES4: ${{ secrets.YTCOOKIES4 }}
-        run: |
-          mkdir -p cookies
-          i=1
-          for v in "$YTCOOKIES1" "$YTCOOKIES2" "$YTCOOKIES3" "$YTCOOKIES4"; do
-            if [ -n "$v" ]; then
-              printf '%s' "$v" | base64 -d > "cookies/$i.txt" 2>/dev/null || printf '%s\n' "$v" > "cookies/$i.txt"
-              i=$((i+1))
-            fi
-          done
-          echo "cookies inyectadas: $(ls cookies/*.txt 2>/dev/null | wc -l)"
-          head -1 cookies/1.txt 2>/dev/null || echo "(sin cookies)"
-      - name: match shard
-        env:
-          MATCH_CANDS: "2"
-          MATCH_MAXSPAN: "90"
-          MATCH_COARSE: "22"
-          MATCH_POOL: "10"
-        run: node scripts/match_runner.mjs "${{ github.event.inputs.slug }}" ${{ matrix.idx }} ${{ github.event.inputs.chunks }} "match_${{ github.event.inputs.slug }}.json"
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          MATCH_CANDS: "6"
+          MATCH_POOL: "12"
+        run: node match_sb.mjs "${{ github.event.inputs.slug }}" ${{ matrix.idx }} ${{ github.event.inputs.chunks }} "match_${{ github.event.inputs.slug }}.json"
       - uses: actions/upload-artifact@v4
         with:
           name: matchpart-${{ matrix.idx }}
@@ -160,10 +108,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-        with:
-          path: parts
-          pattern: "matchpart-*"
-          merge-multiple: true
+        with: { path: parts, pattern: "matchpart-*", merge-multiple: true }
       - name: merge
         run: node scripts/match_merge.mjs "${{ github.event.inputs.slug }}" parts
       - uses: actions/upload-artifact@v4
