@@ -92,11 +92,6 @@ jobs:
       - name: match shard (storyboard + API)
         env:
           YT_API_KEY: ${{ secrets.YT_API_KEY }}
-          YT_API_KEY2: ${{ secrets.YT_API_KEY2 }}
-          YT_API_KEY3: ${{ secrets.YT_API_KEY3 }}
-          YT_API_KEY4: ${{ secrets.YT_API_KEY4 }}
-          YT_API_KEY5: ${{ secrets.YT_API_KEY5 }}
-          YT_API_KEY6: ${{ secrets.YT_API_KEY6 }}
           MATCH_CANDS: "6"
           MATCH_POOL: "12"
         run: node match_sb.mjs "${{ github.event.inputs.slug }}" ${{ matrix.idx }} ${{ github.event.inputs.chunks }} "match_${{ github.event.inputs.slug }}.json"
