@@ -85,13 +85,17 @@ jobs:
         with:
           path: ~/bincache
           key: ytffmpeg-v1
-      - name: install yt-dlp + ffmpeg
+      - name: install yt-dlp (pip) + PO token plugin + ffmpeg
         run: |
-          mkdir -p ~/bincache
-          curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o ~/bincache/yt-dlp
-          chmod a+rx ~/bincache/yt-dlp
-          sudo cp ~/bincache/yt-dlp /usr/local/bin/yt-dlp
+          # yt-dlp por pip para que el plugin del PO token se auto-descubra en el mismo env
+          python3 -m pip install --user --upgrade --break-system-packages yt-dlp bgutil-ytdlp-pot-provider \
+            || python3 -m pip install --user --upgrade yt-dlp bgutil-ytdlp-pot-provider
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.local/bin:$PATH"
           yt-dlp --version
+          yt-dlp -v --print "x" "ytsearch0:x" 2>&1 | grep -i "pot\|bgutil" | head -3 || true
+          # ffmpeg estatico
+          mkdir -p ~/bincache
           if [ ! -f ~/bincache/ffmpeg ]; then
             curl -L https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -o /tmp/ff.tar.xz
             tar -xf /tmp/ff.tar.xz -C /tmp
@@ -99,6 +103,15 @@ jobs:
             chmod a+rx ~/bincache/ffmpeg
           fi
           sudo cp ~/bincache/ffmpeg /usr/local/bin/ffmpeg
+      - name: start PO token provider (bgutil, Docker en :4416)
+        run: |
+          docker run --name bgutil -d -p 4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          echo "esperando el provider..."
+          for i in $(seq 1 40); do
+            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then echo "provider UP"; break; fi
+            sleep 2
+          done
+          curl -s http://127.0.0.1:4416/ping || echo "(ping fallo — sigo igual)"
       - name: install deno (resuelve el JS n-challenge de YouTube)
         run: |
           curl -fsSL https://deno.land/install.sh | DENO_INSTALL=$HOME/.deno sh
